@@ -525,7 +525,7 @@ begin
                         io_out(0) <= CMD_WRITE_ENH_VOL_CFG_REG(7);
                         shift_reg(31 downto 25) <= CMD_WRITE_ENH_VOL_CFG_REG(6 downto 0);
                         shift_reg(24 downto 17) <= (cfg_reg_val and x"7F") or x"40";
-                        bit_cnt <= 14;
+                        bit_cnt <= 15;
                     elsif sck_falling = '1' then
                         io_out(0) <= shift_reg(31);
                         shift_reg <= shift_reg(30 downto 0) & '0';
