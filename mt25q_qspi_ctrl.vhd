@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- MT25QU128ABA Quad-SPI Controller  (v11)
+-- MT25QU128ABA Quad-SPI Controller  (v12)
 --
 -- Features:
 --   - Quad Page Program (0x32): cmd & addr on 1 line, data on 4 lines
@@ -8,6 +8,7 @@
 --   - Automatic Write Enable before program/erase
 --   - Automatic WIP polling after program/erase
 --   - Enable Quad mode via Enhanced Volatile Config Register
+--   - CS# held high for at least 10 clk cycles between SPI transactions
 --
 -- Interface:
 --   cmd_start   : pulse high for 1 clock to begin an operation
@@ -39,7 +40,8 @@ use work.mt25q_qspi_pkg.all;
 
 entity mt25q_qspi_ctrl is
     generic (
-        CLK_DIV : integer := 4   -- spi_sck = clk / (2 * CLK_DIV)
+        CLK_DIV    : integer := 4;  -- spi_sck = clk / (2 * CLK_DIV)
+        CS_GAP_LEN : integer := 10  -- minimum clk cycles CS# stays high between transactions
     );
     port (
         clk         : in  std_logic;
@@ -75,6 +77,7 @@ architecture rtl of mt25q_qspi_ctrl is
     -- Main FSM
     type state_t is (
         S_IDLE,
+        S_CS_GAP,
         S_WREN_CMD,
         S_SEND_CMD,
         S_SEND_ADDR,
@@ -94,6 +97,10 @@ architecture rtl of mt25q_qspi_ctrl is
 
     signal state        : state_t := S_IDLE;
     signal return_state : state_t := S_IDLE;
+
+    -- CS gap counter and return state
+    signal gap_cnt      : integer range 0 to CS_GAP_LEN - 1 := 0;
+    signal gap_return   : state_t := S_IDLE;
 
     -- SPI clock divider
     signal clk_cnt      : integer range 0 to CLK_DIV - 1 := 0;
@@ -211,9 +218,21 @@ begin
                     end if;
 
                 --------------------------------------------------------
+                --  CS GAP - hold CS# high for CS_GAP_LEN clk cycles
+                --  before proceeding to the next SPI transaction
+                --------------------------------------------------------
+                when S_CS_GAP =>
+                    cs_n   <= '1';
+                    sck_en <= '0';
+                    io_tri <= "1111";
+                    if gap_cnt = 0 then
+                        state <= gap_return;
+                    else
+                        gap_cnt <= gap_cnt - 1;
+                    end if;
+
+                --------------------------------------------------------
                 --  WRITE ENABLE (0x06) - 8 bits on SIO0
-                --  FIX: pre-drive MSB on io_out(0) before first
-                --       rising SCK edge so flash samples bit 7
                 --------------------------------------------------------
                 when S_WREN_CMD =>
                     cs_n      <= '0';
@@ -227,8 +246,6 @@ begin
 
                 --------------------------------------------------------
                 --  SEND COMMAND opcode - 8 bits, single line (IO0)
-                --  FIX: pre-drive MSB when starting a new CS
-                --       transaction (cs_n = '1' on entry)
                 --------------------------------------------------------
                 when S_SEND_CMD =>
                     if state = S_SEND_CMD and cs_n = '1' then
@@ -248,12 +265,14 @@ begin
                         if bit_cnt = 0 then
                             -- Opcode fully shifted out
                             if return_state = S_DONE then
-                                -- This was WREN: deassert CS, then
+                                -- This was WREN: deassert CS, gap, then
                                 -- re-enter to send the real opcode
-                                cs_n   <= '1';
-                                sck_en <= '0';
-                                state <= S_SEND_CMD;
+                                cs_n         <= '1';
+                                sck_en       <= '0';
+                                gap_cnt      <= CS_GAP_LEN - 1;
+                                gap_return   <= S_SEND_CMD;
                                 return_state <= S_SEND_ADDR;
+                                state        <= S_CS_GAP;
                             else
                                 -- Real opcode done, move to address phase
                                 state <= return_state;
@@ -288,10 +307,12 @@ begin
                                 tx_nib_cnt <= 0;
                                 io_tri     <= "0000"; -- all 4 lines output
                             elsif saved_op = "10" then
-                                -- Erase: command complete, deassert CS and poll
-                                cs_n   <= '1';
-                                sck_en <= '0';
-                                state  <= S_POLL_CMD;
+                                -- Erase: command complete, deassert CS, gap, then poll
+                                cs_n       <= '1';
+                                sck_en     <= '0';
+                                gap_cnt    <= CS_GAP_LEN - 1;
+                                gap_return <= S_POLL_CMD;
+                                state      <= S_CS_GAP;
                             end if;
                         else
                             bit_cnt <= bit_cnt - 1;
@@ -365,10 +386,12 @@ begin
                             tx_nib_cnt <= 0;
                             byte_cnt   <= byte_cnt - 1;
                             if byte_cnt = 1 then
-                                -- Last byte sent, end transaction and poll
-                                cs_n   <= '1';
-                                sck_en <= '0';
-                                state  <= S_POLL_CMD;
+                                -- Last byte sent, end transaction, gap, then poll
+                                cs_n       <= '1';
+                                sck_en     <= '0';
+                                gap_cnt    <= CS_GAP_LEN - 1;
+                                gap_return <= S_POLL_CMD;
+                                state      <= S_CS_GAP;
                             else
                                 need_data <= '1';
                             end if;
@@ -377,7 +400,6 @@ begin
 
                 --------------------------------------------------------
                 --  POLL STATUS REGISTER - send opcode 0x05
-                --  FIX: pre-drive MSB before first rising SCK edge
                 --------------------------------------------------------
                 when S_POLL_CMD =>
                     cs_n      <= '0';
@@ -395,12 +417,10 @@ begin
                 when S_POLL_READ =>
                     if sck_falling = '1' and io_tri /= "1111" then
                         if bit_cnt > 0 then
-                            -- Still shifting out opcode bits
                             io_out(0) <= shift_reg(31);
                             shift_reg <= shift_reg(30 downto 0) & '0';
                             bit_cnt   <= bit_cnt - 1;
                         else
-                            -- Last opcode bit sent, switch IO to input
                             io_out(0) <= shift_reg(31);
                             io_tri    <= "1111";
                             bit_cnt   <= 8;
@@ -414,7 +434,6 @@ begin
                 when S_POLL_WAIT =>
                     io_tri <= "1111";
                     if sck_rising = '1' then
-                        -- Shift in status byte from IO1 (standard SO line)
                         status_byte <= status_byte(6 downto 0) & spi_io_i(1);
                         if bit_cnt = 0 then
                             cs_n   <= '1';
@@ -423,8 +442,10 @@ begin
                                 -- WIP = 0, flash is ready
                                 state <= S_DONE;
                             else
-                                -- Flash still busy, poll again
-                                state <= S_POLL_CMD;
+                                -- Flash still busy, gap then poll again
+                                gap_cnt    <= CS_GAP_LEN - 1;
+                                gap_return <= S_POLL_CMD;
+                                state      <= S_CS_GAP;
                             end if;
                         else
                             bit_cnt <= bit_cnt - 1;
@@ -434,7 +455,6 @@ begin
                 --------------------------------------------------------
                 --  ENABLE QUAD MODE - Step 1:
                 --  Read Enhanced Volatile Config Register (0x65)
-                --  FIX: pre-drive MSB before first rising SCK edge
                 --------------------------------------------------------
                 when S_EQCFG_READ_CMD =>
                     cs_n      <= '0';
@@ -451,24 +471,24 @@ begin
                 --------------------------------------------------------
                 when S_EQCFG_READ_DATA =>
                     if sck_falling = '1' and bit_cnt > 0 and io_tri /= "1111" then
-                        -- Shifting out opcode on IO0
                         io_out(0) <= shift_reg(31);
                         shift_reg <= shift_reg(30 downto 0) & '0';
                         bit_cnt   <= bit_cnt - 1;
 
                     elsif bit_cnt = 0 and sck_falling = '1' and io_tri /= "1111" then
-                        -- Opcode fully sent, switch to input mode for 8-bit read
                         io_out(0) <= shift_reg(31);
                         io_tri    <= "1111";
                         bit_cnt   <= 8;
 
                     elsif io_tri = "1111" and sck_rising = '1' then
-                        -- Shift in config register byte from IO1 (SO)
                         cfg_reg_val <= cfg_reg_val(6 downto 0) & spi_io_i(1);
                         if bit_cnt = 0 then
-                            cs_n   <= '1';
-                            sck_en <= '0';
-                            state  <= S_EQCFG_WREN;
+                            -- Done reading config, deassert CS, gap, then WREN
+                            cs_n       <= '1';
+                            sck_en     <= '0';
+                            gap_cnt    <= CS_GAP_LEN - 1;
+                            gap_return <= S_EQCFG_WREN;
+                            state      <= S_CS_GAP;
                         else
                             bit_cnt <= bit_cnt - 1;
                         end if;
@@ -477,7 +497,6 @@ begin
                 --------------------------------------------------------
                 --  ENABLE QUAD MODE - Step 3:
                 --  Send Write Enable (0x06) before modifying config
-                --  FIX: pre-drive MSB before first rising SCK edge
                 --------------------------------------------------------
                 when S_EQCFG_WREN =>
                     cs_n      <= '0';
@@ -497,10 +516,12 @@ begin
                         io_out(0) <= shift_reg(31);
                         shift_reg <= shift_reg(30 downto 0) & '0';
                         if bit_cnt = 0 then
-                            -- WREN sent, deassert CS
-                            cs_n   <= '1';
-                            sck_en <= '0';
-                            state  <= S_EQCFG_WRITE_DATA;
+                            -- WREN sent, deassert CS, gap, then write config
+                            cs_n       <= '1';
+                            sck_en     <= '0';
+                            gap_cnt    <= CS_GAP_LEN - 1;
+                            gap_return <= S_EQCFG_WRITE_DATA;
+                            state      <= S_CS_GAP;
                         else
                             bit_cnt <= bit_cnt - 1;
                         end if;
@@ -511,7 +532,6 @@ begin
                 --  Write modified config register value (0x61 + data)
                 --  Bit 7 cleared = quad I/O enabled
                 --  Bit 6 set     = dual I/O disabled
-                --  FIX: pre-drive MSB before first rising SCK edge
                 --------------------------------------------------------
                 when S_EQCFG_WRITE_DATA =>
                     if cs_n = '1' then
@@ -519,10 +539,8 @@ begin
                         sck_en    <= '1';
                         io_tri    <= "1110";
                         io_out(0) <= CMD_WRITE_ENH_VOL_CFG_REG(7);  -- pre-drive MSB
-                        -- Load opcode (pre-shifted) + modified config byte
                         shift_reg(31 downto 24) <= CMD_WRITE_ENH_VOL_CFG_REG(6 downto 0) & ((cfg_reg_val(7) and '0') or '0');
                         shift_reg(23 downto 16) <= ((cfg_reg_val and x"7F") or x"40");
-                        -- One bit pre-driven from opcode, 7 remaining opcode + 8 config = 15
                         bit_cnt <= 15;
                     elsif sck_falling = '1' then
                         io_out(0) <= shift_reg(31);
